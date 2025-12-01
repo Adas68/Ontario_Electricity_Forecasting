@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# Virtual environment
+venv/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Excel files (if you don't want to upload them)
+*.xlsx
+*.xls
+
+# Model checkpoints (optional)
+models/*.h5
+models/*.keras
