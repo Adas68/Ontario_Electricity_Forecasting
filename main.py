@@ -1,179 +1,195 @@
-"""
-Ontario Electricity Demand Forecasting - Final Demo Code
-Group 2: Apon Das, Ritwick Vemula, Rayyan Nezami
-Course: AISE4010
-"""
+# Install required packages (run this first in Colab)
+# !pip install tensorflow statsmodels openpyxl
 
-import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import LSTM, GRU, Dense, Conv1D, MaxPooling1D, Flatten, Dropout, Bidirectional
 from tensorflow.keras.optimizers import Adam
-import json
-import warnings
-warnings.filterwarnings("ignore")
+from tensorflow.keras.callbacks import EarlyStopping
+import os
+import statsmodels.api as sm
+from sklearn.preprocessing import PolynomialFeatures
 
-# -----------------------------
-# 1. DATA LOADING & CLEANING
-# -----------------------------
-def load_and_clean_data(filepath):
-    print("🔍 Loading and cleaning data...")
-    # Load raw Excel file (no header assumed)
-    df_raw = pd.read_excel(filepath, header=None)
-    
-    # Keep only rows where column 1 (Hour) is numeric → this skips metadata like "\\Hourly Demand Report"
-    df_raw = df_raw[pd.to_numeric(df_raw.iloc[:, 1], errors='coerce').notnull()]
-    df_raw = df_raw.dropna().reset_index(drop=True)
-    df_raw.columns = ['Date', 'Hour', 'Market_Demand', 'Ontario_Demand']
-    
-    # Convert Hour to int
-    df_raw['Hour'] = df_raw['Hour'].astype(int)
-    
-    # Handle Hour=24 → treat as 00:00 next day
-    df_raw['Hour_adj'] = df_raw['Hour'].replace(24, 0)
-    df_raw['Date'] = pd.to_datetime(df_raw['Date'])
-    df_raw['DateTime'] = pd.to_datetime(
-        df_raw['Date'].astype(str) + ' ' + df_raw['Hour_adj'].astype(str).str.zfill(2) + ':00:00'
-    )
-    # Shift DateTime by 1 day where original Hour was 24
-    df_raw.loc[df_raw['Hour'] == 24, 'DateTime'] += pd.Timedelta(days=1)
-    
-    df_raw.set_index('DateTime', inplace=True)
-    # Keep only Ontario_Demand as target
-    data = df_raw[['Ontario_Demand']].astype(float).copy()
-    
-    # Add time features
+print(f"TensorFlow version: {tf.__version__}")
+
+def load_and_preprocess_data(file_path):
+    print("Loading and preprocessing data...")
+    df_raw = pd.read_excel(file_path, header=None, engine='openpyxl')
+    df_clean = df_raw[pd.to_numeric(df_raw.iloc[:, 1], errors='coerce').notnull()].copy()
+    df_clean = df_clean.dropna()
+    df_clean.columns = ['Date', 'Hour', 'Market_Demand', 'Ontario_Demand']
+    df_clean['Hour'] = df_clean['Hour'].astype(int)
+    df_clean['Hour_24_fixed'] = df_clean['Hour'].replace(24, 0)
+    df_clean['Date'] = pd.to_datetime(df_clean['Date'])
+    df_clean['DateTime'] = pd.to_datetime(df_clean['Date'].astype(str) + ' ' + df_clean['Hour_24_fixed'].astype(str).str.zfill(2) + ':00:00')
+    df_clean.loc[df_clean['Hour'] == 24, 'DateTime'] += pd.Timedelta(days=1)
+    df_clean.set_index('DateTime', inplace=True)
+    data = df_clean[['Ontario_Demand']].astype(float).copy()
     data['HourOfDay'] = data.index.hour
     data['DayOfWeek'] = data.index.dayofweek
     data['Month'] = data.index.month
     data['IsWeekend'] = (data.index.dayofweek >= 5).astype(int)
-    
-    print(f"✅ Data loaded: {data.index.min()} to {data.index.max()}")
-    return data
+    print(f"Data range: {data.index.min()} to {data.index.max()}")
+    train_data = data.loc[:'2025-06-30 23:00:00']
+    test_data = data.loc['2025-07-01 00:00:00':'2025-09-30 23:00:00']
+    print(f"Train samples: {len(train_data)} | Test samples: {len(test_data)}")
+    return train_data, test_data
 
-# -----------------------------
-# 2. CREATE SEQUENCES
-# -----------------------------
 def create_sequences(data, seq_len=24):
     X, y = [], []
     for i in range(len(data) - seq_len):
         X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len, 0])  # predict Ontario_Demand
+        y.append(data[i+seq_len, 0])
     return np.array(X), np.array(y)
 
-# -----------------------------
-# 3. MAIN EXECUTION
-# -----------------------------
-def main():
-    FILE = 'PUB_Demand.csv.xlsx'
-    
-    # Ensure results folder exists
-    os.makedirs('results', exist_ok=True)
-    
-    # Load and clean data
-    full_data = load_and_clean_data(FILE)
-    
-    # Split: Train = Jan 1 – Jun 30, 2025 | Test = Jul 1 – Sep 30, 2025
-    train_data = full_data.loc[:'2025-06-30 23:00:00']
-    test_data = full_data.loc['2025-07-01 00:00:00':'2025-09-30 23:00:00']
-    
-    print(f"📊 Train samples: {len(train_data)} | Test samples: {len(test_data)}")
-    
-    if len(test_data) == 0:
-        raise ValueError("❌ Test set is empty! Check your date range.")
-    
-    # Define features (must match order used in scaling)
-    feature_cols = ['Ontario_Demand', 'HourOfDay', 'DayOfWeek', 'Month', 'IsWeekend']
-    train_vals = train_data[feature_cols].values
-    test_vals = test_data[feature_cols].values
-    
-    # Scale data
-    scaler = MinMaxScaler()
-    train_scaled = scaler.fit_transform(train_vals)
-    test_scaled = scaler.transform(test_vals)
-    
-    # Create sequences (past 24 hours → predict next hour)
-    SEQ_LEN = 24
-    X_train, y_train = create_sequences(train_scaled, SEQ_LEN)
-    X_test, y_test = create_sequences(test_scaled, SEQ_LEN)
-    
-    print(f"🔁 Sequences → Train: {X_train.shape}, Test: {X_test.shape}")
-    
-    # Build LSTM model
+def scale_data(train_data, test_data, feature_columns):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    train_scaled = scaler.fit_transform(train_data[feature_columns])
+    test_scaled = scaler.transform(test_data[feature_columns])
+    return scaler, train_scaled, test_scaled
+
+def create_lstm_model(input_shape, neurons=50, dropout=0.2):
     model = Sequential([
-        LSTM(32, activation='relu', input_shape=(SEQ_LEN, len(feature_cols))),
-        Dropout(0.2),
+        LSTM(neurons, activation='relu', input_shape=input_shape, return_sequences=True),
+        Dropout(dropout),
+        LSTM(neurons, activation='relu'),
+        Dropout(dropout),
         Dense(1)
     ])
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-    print("🧠 Training LSTM (20 epochs)...")
-    
-    # Train
-    model.fit(X_train, y_train, epochs=20, batch_size=32, 
-              validation_data=(X_test, y_test), verbose=0)
-    
-    # Predict
-    y_pred = model.predict(X_test, verbose=0).flatten()
-    
-    # Inverse transform predictions
-    def inverse_transform_ontario(scaler, y_array):
-        dummy = np.zeros((len(y_array), len(feature_cols)))
-        dummy[:, 0] = y_array
-        return scaler.inverse_transform(dummy)[:, 0]
-    
-    y_pred_inv = inverse_transform_ontario(scaler, y_pred)
-    y_test_inv = inverse_transform_ontario(scaler, y_test)
-    
-    # Compute LSTM metrics
-    mae_lstm = mean_absolute_error(y_test_inv, y_pred_inv)
-    rmse_lstm = np.sqrt(mean_squared_error(y_test_inv, y_pred_inv))
-    
-    # Baseline: Predict demand from 24 hours ago (same hour yesterday)
-    baseline_pred = test_data['Ontario_Demand'].shift(24).dropna().values
-    baseline_true = test_data['Ontario_Demand'][24:].values
-    mae_baseline = mean_absolute_error(baseline_true, baseline_pred)
-    rmse_baseline = np.sqrt(mean_squared_error(baseline_true, baseline_pred))
-    
-    # Print results
-    print("\n✅ FINAL RESULTS")
-    print(f"📈 LSTM      → MAE: {mae_lstm:.2f} MW | RMSE: {rmse_lstm:.2f} MW")
-    print(f"🧱 Baseline  → MAE: {mae_baseline:.2f} MW | RMSE: {rmse_baseline:.2f} MW")
-    
-    # Save metrics
-    metrics = {
-        "LSTM_MAE": float(mae_lstm),
-        "LSTM_RMSE": float(rmse_lstm),
-        "Baseline_MAE": float(mae_baseline),
-        "Baseline_RMSE": float(rmse_baseline),
-        "Train_Start": str(train_data.index.min()),
-        "Train_End": str(train_data.index.max()),
-        "Test_Start": str(test_data.index.min()),
-        "Test_End": str(test_data.index.max())
-    }
-    with open('results/metrics.json', 'w') as f:
-        json.dump(metrics, f, indent=4)
-    
-    # Plot first 200 predictions
-    plt.figure(figsize=(12, 5))
-    plt.plot(y_test_inv[:200], label='Actual (MW)', color='steelblue')
-    plt.plot(y_pred_inv[:200], label='LSTM Prediction (MW)', color='crimson', linestyle='--')
-    plt.title('Ontario Hourly Demand Forecast (First 200 Test Samples)')
-    plt.xlabel('Time Step (Hours)')
-    plt.ylabel('Demand (MW)')
-    plt.legend()
+    return model
+
+def create_gru_model(input_shape, neurons=50, dropout=0.2):
+    model = Sequential([
+        GRU(neurons, activation='relu', input_shape=input_shape, return_sequences=True),
+        Dropout(dropout),
+        GRU(neurons, activation='relu'),
+        Dropout(dropout),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+    return model
+
+def create_tcn_model(input_shape, neurons=50, dropout=0.2):
+    model = Sequential([
+        Conv1D(filters=64, kernel_size=3, activation='relu', input_shape=input_shape, padding='causal'),
+        MaxPooling1D(pool_size=2),
+        Conv1D(filters=64, kernel_size=3, activation='relu', padding='causal'),
+        MaxPooling1D(pool_size=2),
+        Flatten(),
+        Dense(neurons, activation='relu'),
+        Dropout(dropout),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+    return model
+
+def create_fnn_model(input_shape, neurons=64, dropout=0.2):
+    model = Sequential([
+        Flatten(input_shape=input_shape),
+        Dense(neurons, activation='relu'),
+        Dropout(dropout),
+        Dense(neurons, activation='relu'),
+        Dropout(dropout),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+    return model
+
+def create_bidirectional_lstm_model(input_shape, neurons=50, dropout=0.2):
+    model = Sequential([
+        Bidirectional(LSTM(neurons, activation='relu', input_shape=input_shape, return_sequences=True)),
+        Dropout(dropout),
+        Bidirectional(LSTM(neurons, activation='relu')),
+        Dropout(dropout),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+    return model
+
+def train_and_evaluate_model(model, X_train, y_train, X_test, y_test, model_name, scaler, feature_columns):
+    print(f"\n--- Training {model_name} ---")
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    history = model.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_test, y_test), callbacks=[early_stop], verbose=1)
+    y_pred = model.predict(X_test)
+    pred_reshaped = np.zeros((y_pred.shape[0], len(feature_columns)))
+    pred_reshaped[:, 0] = y_pred[:, 0]
+    test_reshaped = np.zeros((y_test.shape[0], len(feature_columns)))
+    test_reshaped[:, 0] = y_test
+    y_pred_inv = scaler.inverse_transform(pred_reshaped)[:, 0]
+    y_test_inv = scaler.inverse_transform(test_reshaped)[:, 0]
+    mae = mean_absolute_error(y_test_inv, y_pred_inv)
+    rmse = np.sqrt(mean_squared_error(y_test_inv, y_pred_inv))
+    print(f"{model_name} - MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+    plt.figure(figsize=(12, 6))
+    plt.plot(y_test_inv, label="Actual", color="blue", linewidth=2)
+    plt.plot(y_pred_inv, label="Predicted", color="red", linestyle="--", linewidth=2)
+    plt.title(f"{model_name}: Actual vs Predicted Demand", fontsize=16)
+    plt.xlabel("Time Step", fontsize=12)
+    plt.ylabel("Demand (MW)", fontsize=12)
+    plt.legend(fontsize=12)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('results/forecast_results.png', dpi=150)
-    plt.close()
-    
-    print("\n📁 Outputs saved to 'results/' folder:")
-    print("   - metrics.json")
-    print("   - forecast_results.png")
-    print("\n🎉 Code demo ready! All components cohesive and functional.")
+    plt.savefig(f"{model_name}_results.png", dpi=150)
+    plt.show()
+    return mae, rmse, history
+
+def main():
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    file_path = 'PUB_Demand.csv.xlsx'
+    train_data, test_data = load_and_preprocess_data(file_path)
+    feature_columns = ['Ontario_Demand', 'HourOfDay', 'DayOfWeek', 'Month', 'IsWeekend']
+    scaler, train_scaled, test_scaled = scale_data(train_data, test_data, feature_columns)
+    seq_length = 24
+    X_train, y_train = create_sequences(train_scaled, seq_length)
+    X_test, y_test = create_sequences(test_scaled, seq_length)
+    print(f"\nX_train shape: {X_train.shape}")
+    print(f"X_test shape: {X_test.shape}")
+    X_train = X_train.reshape((X_train.shape[0], seq_length, len(feature_columns)))
+    X_test = X_test.reshape((X_test.shape[0], seq_length, len(feature_columns)))
+    models = {
+        'LSTM': create_lstm_model,
+        'GRU': create_gru_model,
+        'TCN': create_tcn_model,
+        'FNN': create_fnn_model,
+        'Bidirectional LSTM': create_bidirectional_lstm_model
+    }
+    results = {}
+    for name, model_fn in models.items():
+        print(f"\n{'='*60}")
+        print(f"Creating {name} model...")
+        model = model_fn(input_shape=(seq_length, len(feature_columns)))
+        mae, rmse, _ = train_and_evaluate_model(model, X_train, y_train, X_test, y_test, name, scaler, feature_columns)
+        results[name] = {'MAE': mae, 'RMSE': rmse}
+    print("\n" + "="*60)
+    print("=== FINAL MODEL COMPARISON ===")
+    print("="*60)
+    for name, metrics in results.items():
+        print(f"{name:20s}: MAE={metrics['MAE']:7.2f}, RMSE={metrics['RMSE']:7.2f}")
+    plt.figure(figsize=(10, 6))
+    model_names = list(results.keys())
+    mae_values = [results[name]['MAE'] for name in model_names]
+    rmse_values = [results[name]['RMSE'] for name in model_names]
+    x = np.arange(len(model_names))
+    width = 0.35
+    plt.bar(x - width/2, mae_values, width, label='MAE', alpha=0.8)
+    plt.bar(x + width/2, rmse_values, width, label='RMSE', alpha=0.8)
+    plt.xlabel('Models', fontsize=12)
+    plt.ylabel('Error', fontsize=12)
+    plt.title('Model Performance Comparison', fontsize=14)
+    plt.xticks(x, model_names, rotation=45, ha='right')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('model_comparison.png', dpi=150)
+    plt.show()
+    print("\nCode execution complete. Check generated plots and metrics.")
 
 if __name__ == "__main__":
     main()
